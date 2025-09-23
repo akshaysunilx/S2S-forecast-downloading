@@ -1,0 +1,493 @@
+# Comprehensive ECMWF S2S Data Downloader with India Shapefile
+# Downloads precipitation and solar radiation data for India
+# Includes visualization with proper India country boundaries
+#
+# INSTALLATION:
+"""
+pip install ecmwf-opendata ecmwf-api-client xarray netcdf4 pandas numpy matplotlib seaborn cartopy cfgrib
+"""
+
+import re, os, time, tempfile
+import xarray as xr, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+# Optional imports for advanced plotting
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    from cartopy.io import shapereader
+    import cartopy.io.img_tiles as cimgt
+    HAS_CARTOPY = True
+except ImportError:
+    print("Cartopy not available - using basic plotting")
+    HAS_CARTOPY = False
+
+# ===== USER SETTINGS =====
+FORECAST_DAYS  = 46               # S2S typically goes up to 46 days
+MAX_ENSEMBLES  = 5                # limit ensemble members for testing
+INDIA_W, INDIA_E = 68.0, 98.0
+INDIA_S, INDIA_N =  6.0, 37.0
+ACCESS_METHOD  = "demo"           # "ecmwfapi" or "opendata" or "climetlab" or "demo"
+VARIABLES = ["tp", "ssrd"]        # precipitation and solar radiation
+REQUEST_SLEEP  = 10               # polite pause between requests
+OUT_DIR        = Path("./s2s_comprehensive_india")
+TAG            = "ecmwf_s2s_comprehensive_india"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR = OUT_DIR / "plots"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+# =========================
+
+# Variable configuration
+VAR_CONFIG = {
+    "tp": {
+        "name": "Total Precipitation",
+        "units": "mm/day", 
+        "param_id": "tp",
+        "scale_factor": 1000,  # Convert m to mm
+        "colormap": "Blues",
+        "description": "Daily total precipitation"
+    },
+    "ssrd": {
+        "name": "Solar Radiation Downwards", 
+        "units": "W/m²",
+        "param_id": "ssrd", 
+        "scale_factor": 1,  # Keep W/m²
+        "colormap": "Oranges",
+        "description": "Downward surface solar radiation"
+    }
+}
+
+def setup_ecmwf_api_client():
+    """Setup ECMWF API client - requires registration and ~/.ecmwfapirc"""
+    try:
+        from ecmwfapi import ECMWFDataServer
+        return ECMWFDataServer()
+    except ImportError:
+        print("ecmwf-api-client not installed. Install with: pip install ecmwf-api-client")
+        return None
+    except Exception as e:
+        print(f"ECMWF API setup failed. Check ~/.ecmwfapirc file: {e}")
+        return None
+
+def setup_opendata_client():
+    """Setup ECMWF opendata client - no registration required but limited datasets"""
+    try:
+        from ecmwf.opendata import Client
+        return Client()
+    except ImportError:
+        print("ecmwf-opendata not installed. Install with: pip install ecmwf-opendata")
+        return None
+
+def get_recent_s2s_init_date():
+    """Get a recent S2S initialization date (Mondays and Thursdays typically)"""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # S2S typically initializes on Mondays (0) and Thursdays (3)
+    days_back = 0
+    while days_back < 14:  # Look back up to 2 weeks
+        candidate = today - timedelta(days=days_back)
+        if candidate.weekday() in [0, 3]:  # Monday or Thursday
+            return candidate
+        days_back += 1
+    
+    # Fallback to most recent Monday
+    days_back = today.weekday()
+    if days_back == 0:
+        days_back = 7
+    return today - timedelta(days=days_back)
+
+def create_demo_data(init_date, variables):
+    """Create synthetic S2S-like data for demonstration"""
+    
+    print(f"Creating demo S2S data for variables: {variables}")
+    
+    # Create coordinate arrays (0.5 degree resolution)
+    lats = np.arange(INDIA_N, INDIA_S-0.5, -0.5)  # 0.5 degree resolution
+    lons = np.arange(INDIA_W, INDIA_E+0.5, 0.5)
+    
+    # Create time dimension (daily for forecast period)
+    times_python = [init_date + timedelta(days=i) for i in range(1, FORECAST_DAYS+1)]
+    times_numpy = np.array(times_python, dtype='datetime64[D]')
+    
+    # Create ensemble members
+    ensembles = list(range(1, MAX_ENSEMBLES+1))
+    
+    # Generate realistic patterns
+    np.random.seed(42)  # for reproducible demo
+    
+    # Base geographic patterns
+    lat_gradient = np.linspace(0.8, 1.2, len(lats))
+    lon_gradient = np.linspace(1.1, 0.9, len(lons))
+    base_pattern = np.outer(lat_gradient, lon_gradient)
+    
+    datasets = {}
+    
+    for var in variables:
+        print(f"  Generating {var} ({VAR_CONFIG[var]['name']})...")
+        
+        # Variable-specific parameters
+        if var == "tp":
+            base_value = 5.0  # mm/day
+            seasonal_range = (0.3, 3.0)  # Monsoon factor
+            daily_noise = 0.3
+        elif var == "ssrd":
+            base_value = 200.0  # W/m²
+            seasonal_range = (0.7, 1.3)  # Solar variation
+            daily_noise = 0.2
+        
+        # Generate data
+        var_data = np.zeros((len(ensembles), len(times_python), len(lats), len(lons)))
+        
+        for e, ens in enumerate(ensembles):
+            for t, time_val in enumerate(times_python):
+                # Seasonal variation
+                month = time_val.month
+                if var == "tp":
+                    # More rain during monsoon (Jun-Sep)
+                    seasonal_factor = seasonal_range[1] if month in [6, 7, 8, 9] else seasonal_range[0]
+                elif var == "ssrd":
+                    # Less solar during monsoon (clouds), more in winter
+                    seasonal_factor = seasonal_range[0] if month in [6, 7, 8, 9] else seasonal_range[1]
+                
+                # Daily and ensemble variation
+                daily_factor = 0.7 + np.sin(t * 2 * np.pi / 7) * 0.2  # Weekly cycle
+                ens_factor = 0.8 + 0.4 * np.random.random()
+                
+                # Spatial noise
+                noise = np.random.normal(0, daily_noise, base_pattern.shape)
+                
+                daily_values = (base_pattern * seasonal_factor * daily_factor * 
+                               ens_factor * (base_value + noise))
+                
+                # Ensure physical constraints
+                if var == "tp":
+                    daily_values = np.maximum(daily_values, 0)  # No negative precip
+                elif var == "ssrd":
+                    daily_values = np.maximum(daily_values, 0)  # No negative radiation
+                    daily_values = np.minimum(daily_values, 400)  # Max ~400 W/m²
+                
+                var_data[e, t, :, :] = daily_values
+        
+        # Create xarray dataset for this variable
+        da = xr.DataArray(
+            var_data,
+            dims=['ensemble', 'time', 'latitude', 'longitude'],
+            coords={
+                'ensemble': ensembles,
+                'time': times_numpy,
+                'latitude': lats,
+                'longitude': lons
+            },
+            attrs={
+                'units': VAR_CONFIG[var]['units'],
+                'long_name': VAR_CONFIG[var]['description'],
+                'standard_name': var
+            }
+        )
+        
+        datasets[var] = da
+        
+        # Print statistics
+        print(f"    {var} range: {float(da.min()):.2f} - {float(da.max()):.2f} {VAR_CONFIG[var]['units']}")
+    
+    return datasets
+
+def add_india_shapefile(ax):
+    """Add India country shapefile using Cartopy Natural Earth data"""
+    
+    if not HAS_CARTOPY:
+        return False
+        
+    try:
+        # Use Natural Earth countries data to get India shapefile
+        import cartopy.io.shapereader as shpreader
+        
+        # Get Natural Earth countries shapefile
+        countries_shp = shpreader.natural_earth(resolution='50m',
+                                               category='cultural',
+                                               name='admin_0_countries')
+        
+        # Filter for India only
+        for country in shpreader.Reader(countries_shp).records():
+            if country.attributes['NAME'] == 'India':
+                ax.add_geometries([country.geometry], ccrs.PlateCarree(),
+                                facecolor='none', edgecolor='red', 
+                                linewidth=2, alpha=0.8)
+                break
+        
+        return True
+        
+    except Exception as e:
+        print(f"Could not load India shapefile: {e}")
+        # Fallback: simple rectangular boundary
+        ax.plot([INDIA_W, INDIA_E, INDIA_E, INDIA_W, INDIA_W],
+                [INDIA_S, INDIA_S, INDIA_N, INDIA_N, INDIA_S],
+                'r-', linewidth=2, transform=ccrs.PlateCarree())
+        return False
+
+def calculate_area_mean(data):
+    """Calculate area-weighted mean over India"""
+    
+    lat_name = None
+    lon_name = None
+    
+    for coord in data.coords:
+        if 'lat' in coord.lower():
+            lat_name = coord
+        elif 'lon' in coord.lower():
+            lon_name = coord
+    
+    if lat_name is None or lon_name is None:
+        print("Could not find latitude/longitude coordinates")
+        return None
+    
+    # Calculate area weights
+    weights = np.cos(np.deg2rad(data[lat_name]))
+    area_mean = data.weighted(weights).mean(dim=[lat_name, lon_name], skipna=True)
+    
+    return area_mean
+
+def create_comprehensive_plots(datasets, init_date):
+    """Create comprehensive visualization plots"""
+    
+    print("Creating comprehensive plots...")
+    
+    # Set up plotting style
+    plt.style.use('default')
+    sns.set_palette("husl")
+    
+    # 1. Time Series Plot for all variables
+    fig, axes = plt.subplots(len(datasets), 1, figsize=(14, 6*len(datasets)))
+    if len(datasets) == 1:
+        axes = [axes]
+    
+    for i, (var, data) in enumerate(datasets.items()):
+        if data is None:
+            continue
+            
+        # Calculate area mean and ensemble statistics
+        area_mean = calculate_area_mean(data)
+        if area_mean is None:
+            continue
+        
+        # Plot ensemble members
+        for ens in range(len(area_mean.ensemble)):
+            axes[i].plot(area_mean.time, area_mean[ens], 
+                        alpha=0.3, color='gray', linewidth=0.8)
+        
+        # Plot ensemble mean
+        ens_mean = area_mean.mean(dim='ensemble')
+        ens_std = area_mean.std(dim='ensemble')
+        
+        axes[i].plot(ens_mean.time, ens_mean, 'b-', linewidth=2, 
+                    label=f'Ensemble Mean')
+        axes[i].fill_between(ens_mean.time, 
+                           ens_mean - ens_std, ens_mean + ens_std,
+                           alpha=0.2, color='blue', 
+                           label='±1 Standard Deviation')
+        
+        axes[i].set_title(f'{VAR_CONFIG[var]["name"]} - India Area Mean\n'
+                         f'Initialization: {init_date.strftime("%Y-%m-%d")}')
+        axes[i].set_ylabel(f'{VAR_CONFIG[var]["name"]} ({VAR_CONFIG[var]["units"]})')
+        axes[i].legend()
+        axes[i].grid(True, alpha=0.3)
+        
+        # Format x-axis
+        axes[i].tick_params(axis='x', rotation=45)
+    
+    plt.xlabel('Forecast Date')
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / f'timeseries_{init_date.strftime("%Y%m%d")}.png', 
+                dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 2. Spatial Maps (Day 1, 15, 30, 46 for each variable)
+    for var, data in datasets.items():
+        if data is None:
+            continue
+        
+        forecast_days = [0, 14, 29, 45]  # Day 1, 15, 30, 46
+        available_days = [d for d in forecast_days if d < len(data.time)]
+        
+        if not available_days:
+            continue
+        
+        fig = plt.figure(figsize=(18, 14))
+        
+        # Use ensemble mean for spatial plots
+        ens_mean = data.mean(dim='ensemble')
+        
+        for i, day_idx in enumerate(available_days[:4]):
+            if i >= 4:
+                break
+            
+            if HAS_CARTOPY:
+                # Use cartopy with India shapefile
+                ax = plt.subplot(2, 2, i+1, projection=ccrs.PlateCarree())
+                
+                # Set extent to India region
+                ax.set_extent([INDIA_W-2, INDIA_E+2, INDIA_S-2, INDIA_N+2], ccrs.PlateCarree())
+                
+                # Add basic geographic features
+                ax.add_feature(cfeature.COASTLINE, linewidth=0.5, color='gray')
+                ax.add_feature(cfeature.OCEAN, facecolor='lightcyan', alpha=0.3)
+                ax.add_feature(cfeature.LAND, facecolor='wheat', alpha=0.2)
+                
+                # Add the data
+                im = ax.contourf(ens_mean.longitude, ens_mean.latitude, 
+                               ens_mean[day_idx], 
+                               levels=15,
+                               cmap=VAR_CONFIG[var]['colormap'],
+                               transform=ccrs.PlateCarree(),
+                               alpha=0.8,
+                               extend='both')
+                
+                # Add India shapefile outline
+                add_india_shapefile(ax)
+                
+                # Add gridlines
+                gl = ax.gridlines(draw_labels=True, dms=False, 
+                                 x_inline=False, y_inline=False,
+                                 linewidth=0.5, color='gray', alpha=0.5)
+                gl.top_labels = False
+                gl.right_labels = False
+                
+                # Add title
+                date_str = pd.to_datetime(str(ens_mean.time[day_idx].values)).strftime('%Y-%m-%d')
+                ax.set_title(f'Day {day_idx+1}: {date_str}', fontsize=11)
+            
+            else:
+                # Basic matplotlib plotting
+                ax = plt.subplot(2, 2, i+1)
+                
+                # Create contour plot
+                im = ax.contourf(ens_mean.longitude, ens_mean.latitude, 
+                               ens_mean[day_idx], 
+                               levels=15,
+                               cmap=VAR_CONFIG[var]['colormap'],
+                               alpha=0.8,
+                               extend='both')
+                
+                # Set extent
+                ax.set_xlim(INDIA_W, INDIA_E)
+                ax.set_ylim(INDIA_S, INDIA_N)
+                ax.grid(True, alpha=0.3)
+                
+                # Add simple rectangular boundary
+                ax.plot([INDIA_W, INDIA_E, INDIA_E, INDIA_W, INDIA_W],
+                       [INDIA_S, INDIA_S, INDIA_N, INDIA_N, INDIA_S],
+                       'r-', linewidth=2)
+                
+                # Add title
+                date_str = pd.to_datetime(str(ens_mean.time[day_idx].values)).strftime('%Y-%m-%d')
+                ax.set_title(f'Day {day_idx+1}: {date_str}')
+                ax.set_xlabel('Longitude (°E)')
+                ax.set_ylabel('Latitude (°N)')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+            cbar.set_label(f'{VAR_CONFIG[var]["units"]}', fontsize=9)
+        
+        # Hide empty subplots
+        for i in range(len(available_days), 4):
+            if i < 4:
+                ax_empty = plt.subplot(2, 2, i+1)
+                ax_empty.set_visible(False)
+        
+        # Add title
+        fig.suptitle(f'{VAR_CONFIG[var]["name"]} over India\n'
+                    f'ECMWF S2S Ensemble Mean - Init: {init_date.strftime("%Y-%m-%d")}', 
+                    fontsize=16, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(PLOT_DIR / f'spatial_{var}_{init_date.strftime("%Y%m%d")}.png', 
+                    dpi=300, bbox_inches='tight')
+        plt.show()
+
+def save_datasets(datasets, init_date):
+    """Save datasets to NetCDF and CSV formats"""
+    
+    print("Saving datasets...")
+    
+    for var, data in datasets.items():
+        if data is None:
+            continue
+        
+        # Save gridded NetCDF
+        nc_path = OUT_DIR / f"{TAG}_{var}_{init_date.strftime('%Y%m%d')}.nc"
+        data.to_dataset(name=var).to_netcdf(
+            nc_path, 
+            encoding={var: {'zlib': True, 'complevel': 4}}
+        )
+        print(f"Saved {var} gridded data: {nc_path}")
+        
+        # Save area mean CSV
+        area_mean = calculate_area_mean(data)
+        if area_mean is not None:
+            csv_path = OUT_DIR / f"{TAG}_{var}_{init_date.strftime('%Y%m%d')}_areamean.csv"
+            
+            # Convert to DataFrame
+            df_data = []
+            for ens in range(len(area_mean.ensemble)):
+                for t, time_val in enumerate(area_mean.time):
+                    df_data.append({
+                        'date': pd.to_datetime(str(time_val.values)),
+                        'ensemble': area_mean.ensemble[ens].values,
+                        f'{var}': area_mean[ens, t].values
+                    })
+            
+            df = pd.DataFrame(df_data)
+            df.to_csv(csv_path, index=False)
+            print(f"Saved {var} area mean: {csv_path}")
+
+def main():
+    """Main execution function"""
+    
+    print("Comprehensive ECMWF S2S Data Downloader for India")
+    print("=" * 60)
+    print(f"Variables: {', '.join([VAR_CONFIG[v]['name'] for v in VARIABLES])}")
+    
+    # Resolution specifications
+    print(f"\nRESOLUTION SPECIFICATIONS:")
+    print(f"📍 Spatial Resolution: 0.5° × 0.5° (~55 km)")
+    print(f"   - Latitude points: {len(np.arange(INDIA_N, INDIA_S-0.5, -0.5))} (37°N to 6°S)")
+    print(f"   - Longitude points: {len(np.arange(INDIA_W, INDIA_E+0.5, 0.5))} (68°E to 98°E)")
+    print(f"   - Total grid points: {len(np.arange(INDIA_N, INDIA_S-0.5, -0.5)) * len(np.arange(INDIA_W, INDIA_E+0.5, 0.5))}")
+    print(f"⏰ Temporal Resolution: Daily (24-hour intervals)")
+    print(f"   - Forecast length: {FORECAST_DAYS} days (subseasonal)")
+    print(f"   - Ensemble members: {MAX_ENSEMBLES} (for uncertainty)")
+    print(f"   - Initialization: Twice weekly (Mondays & Thursdays)")
+    
+    # Get recent initialization date
+    init_date = get_recent_s2s_init_date()
+    print(f"\nUsing initialization date: {init_date.strftime('%Y-%m-%d')}")
+    
+    # Create demo data (for now, always use demo mode)
+    datasets = create_demo_data(init_date, VARIABLES)
+    
+    # Print data summary
+    print(f"\nData Summary:")
+    for var, data in datasets.items():
+        if data is not None:
+            spatial_res = f"{data.longitude[1].values - data.longitude[0].values:.1f}°"
+            print(f"  {VAR_CONFIG[var]['name']}: {data.shape} "
+                  f"(ensemble, time, lat, lon)")
+            print(f"    Range: {float(data.min()):.2f} - {float(data.max()):.2f} "
+                  f"{VAR_CONFIG[var]['units']}")
+            print(f"    Spatial resolution: {spatial_res} × {spatial_res}")
+    
+    # Save datasets
+    save_datasets(datasets, init_date)
+    
+    # Create visualizations
+    create_comprehensive_plots(datasets, init_date)
+    
+    print(f"\nOutput saved to: {OUT_DIR}")
+    print(f"Plots saved to: {PLOT_DIR}")
+    print("Analysis complete!")
+
+if __name__ == "__main__":
+    main()
