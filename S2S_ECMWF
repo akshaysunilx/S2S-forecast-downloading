@@ -1,0 +1,426 @@
+# ECMWF S2S (daily) for India -> 4 sites (Pavagada, Noorsar, Raghanesda, Jamkhed)
+# - Demo mode runs without credentials (synthetic but realistic)
+# - "ecmwfapi" mode pulls real ECMWF S2S daily data (needs ~/.ecmwfapirc)
+# - Outputs: per-site CSVs + quick plots; also gridded NetCDFs
+
+import os
+import re
+import time
+import tempfile
+import warnings
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+
+# =================== USER SETTINGS ===================
+ACCESS_METHOD   = "demo"        # "demo" | "ecmwfapi"
+VARIABLES       = ["tp", "ssrd"]  # precip (mm/day), solar (W/m^2)
+FORECAST_DAYS   = 46            # S2S typical horizon
+MAX_ENSEMBLES   = 5             # PF members to fetch (ecmwfapi)
+GRID_RES        = "0.5/0.5"     # output grid from ECMWF
+REQUEST_SLEEP   = 3             # polite pause between ECMWF requests
+
+# Sites with corrected coordinates
+USE_JAMKHED_CORRECTED = True    # Use corrected Jamkhed coordinates
+
+SITES = [
+    {"site": "Pavagada",   "lat": 14.24083,  "lon": 77.45306},
+    {"site": "Noorsar",    "lat": 28.25583,  "lon": 73.23806},
+    {"site": "Raghanesda", "lat": 24.53111,  "lon": 71.25389},
+]
+
+if USE_JAMKHED_CORRECTED:
+    SITES.append({"site": "Jamkhed", "lat": 18.73,     "lon": 75.32})
+else:
+    SITES.append({"site": "Jamkhed", "lat": 19.658333, "lon": 75.618055})
+
+# India bbox (for gridded retrieval / demo generator)
+INDIA_W, INDIA_E = 68.0, 98.0
+INDIA_S, INDIA_N =  6.0, 37.0
+
+# Output paths
+OUT_DIR  = Path("./s2s_sites_india")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR = OUT_DIR / "plots"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Metadata
+VAR_META = {
+    "tp":   dict(name="Total Precipitation", units="mm/day", scale=1000.0, cmap="Blues"),  # ECMWF tp in m/day -> mm/day
+    "ssrd": dict(name="Surface solar radiation downwards", units="W/m²", scale=1.0,  cmap="Oranges"),
+}
+
+
+def recent_s2s_init():
+    """Pick most recent S2S init (Mon or Thu UTC)."""
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    for d in range(0, 14):
+        c = today - timedelta(days=d)
+        if c.weekday() in (0, 3):  # Monday=0, Thursday=3
+            return c
+    return today
+
+
+# ---------------- DEMO (synthetic but realistic) ----------------
+def demo_grids(init_date):
+    """Generate synthetic but realistic seasonal forecast data."""
+    print(">> DEMO mode (synthetic) — runs without credentials.")
+    
+    # Create coordinate arrays
+    lats = np.arange(INDIA_N, INDIA_S - 0.5, -0.5)
+    lons = np.arange(INDIA_W, INDIA_E + 0.5, 0.5)
+    times = np.array([init_date + timedelta(days=i) for i in range(1, FORECAST_DAYS+1)], 
+                     dtype="datetime64[D]")
+    ens = np.arange(1, MAX_ENSEMBLES+1)
+
+    # Base spatial pattern
+    base_pattern = np.outer(np.linspace(0.8, 1.2, len(lats)), 
+                           np.linspace(1.1, 0.9, len(lons)))
+    rng = np.random.default_rng(42)
+
+    datasets = {}
+    for var in VARIABLES:
+        data = np.zeros((len(ens), len(times), len(lats), len(lons)), dtype="float32")
+        
+        for e in range(len(ens)):
+            for t in range(len(times)):
+                forecast_date = init_date + timedelta(days=t+1)
+                month = forecast_date.month
+                
+                if var == "tp":  # Precipitation
+                    # Higher precipitation during monsoon months
+                    seasonal_factor = 3.0 if month in (6, 7, 8, 9) else 0.3
+                    base_value = 5.0
+                    noise = rng.normal(0, 0.3, base_pattern.shape)
+                    # Add weekly cycle and ensemble spread
+                    weekly_cycle = 0.7 + 0.2 * np.sin(t * 2 * np.pi / 7)
+                    ensemble_spread = 0.8 + 0.4 * rng.random()
+                    vals = np.maximum(
+                        base_pattern * seasonal_factor * weekly_cycle * 
+                        ensemble_spread * (base_value + noise), 0
+                    )
+                
+                else:  # Solar radiation (ssrd)
+                    # Lower solar during monsoon months
+                    seasonal_factor = 0.7 if month in (6, 7, 8, 9) else 1.3
+                    base_value = 200.0
+                    noise = rng.normal(0, 0.2, base_pattern.shape)
+                    weekly_cycle = 0.7 + 0.2 * np.sin(t * 2 * np.pi / 7)
+                    ensemble_spread = 0.8 + 0.4 * rng.random()
+                    vals = np.clip(
+                        base_pattern * seasonal_factor * weekly_cycle * 
+                        ensemble_spread * (base_value + noise), 0, 400
+                    )
+                
+                data[e, t] = vals
+        
+        # Create DataArray
+        datasets[var] = xr.DataArray(
+            data, 
+            dims=("ensemble", "time", "latitude", "longitude"),
+            coords={
+                "ensemble": ens,
+                "time": times,
+                "latitude": lats,
+                "longitude": lons
+            },
+            attrs={
+                "units": VAR_META[var]["units"],
+                "long_name": VAR_META[var]["name"]
+            }
+        )
+    
+    return datasets
+
+
+# ---------------- ECMWF Web API (Public Datasets) ----------------
+def ecmwfapi_grids(init_date):
+    """
+    Downloads ECMWF S2S daily-averaged fields for India bbox.
+    Requires: pip install ecmwf-api-client; and ~/.ecmwfapirc (email/key).
+    """
+    try:
+        from ecmwfapi import ECMWFDataServer
+    except ImportError as e:
+        raise RuntimeError(
+            "Install 'ecmwf-api-client' first: pip install ecmwf-api-client"
+        ) from e
+
+    server = ECMWFDataServer()
+    date_str = init_date.strftime("%Y-%m-%d")
+    step_list = "/".join(str(h) for h in range(24, 24*FORECAST_DAYS+1, 24))
+
+    datasets = {}
+    for var in VARIABLES:
+        print(f">> Requesting ECMWF S2S daily {var}...")
+        
+        # Control forecast
+        target_cf = OUT_DIR / f"s2s_ecmf_daily_{var}_cf_{date_str}.grib"
+        req_common = {
+            "dataset": "s2s",
+            "origin": "ecmf",
+            "date": date_str,
+            "time": "00:00:00",
+            "type": "cf",
+            "levtype": "sfc",
+            "param": var,
+            "step": step_list,
+            "area": f"{INDIA_N}/{INDIA_W}/{INDIA_S}/{INDIA_E}",
+            "grid": GRID_RES,
+            "target": str(target_cf),
+        }
+        server.retrieve(req_common)
+        time.sleep(REQUEST_SLEEP)
+
+        # Perturbed forecasts
+        target_pf = OUT_DIR / f"s2s_ecmf_daily_{var}_pf1to{MAX_ENSEMBLES}_{date_str}.grib"
+        req_pf = req_common.copy()
+        req_pf.update({
+            "type": "pf",
+            "number": f"1/to/{MAX_ENSEMBLES}",
+            "target": str(target_pf)
+        })
+        server.retrieve(req_pf)
+        time.sleep(REQUEST_SLEEP)
+
+        # Read GRIB files
+        try:
+            import cfgrib
+            ds_cf = xr.open_dataset(target_cf, engine="cfgrib")
+            ds_pf = xr.open_dataset(target_pf, engine="cfgrib")
+        except ImportError as e:
+            raise RuntimeError(
+                "Install 'cfgrib' and system 'eccodes' to read GRIB files"
+            ) from e
+
+        # Normalize datasets
+        def normalize_dataset(ds):
+            # Convert step to time
+            if "step" in ds:
+                base = np.datetime64(init_date.replace(tzinfo=None), "ns")
+                steps_h = np.array([
+                    int((np.timedelta64(v).astype('timedelta64[h]') / 
+                         np.timedelta64(1, 'h'))) 
+                    for v in ds["step"].values
+                ])
+                times = base + steps_h.astype("timedelta64[h]")
+                ds = (ds.drop_vars([v for v in ds.variables if v == "time"])
+                       .assign_coords(time=("step", times))
+                       .swap_dims({"step": "time"}))
+            
+            # Handle ensemble dimension
+            if "number" in ds.dims:
+                ds = ds.rename({"number": "ensemble"})
+            else:
+                ds = ds.expand_dims({"ensemble": [0]})
+            
+            # Standardize coordinate names
+            if "lat" in ds.coords or "lon" in ds.coords:
+                ds = ds.rename({"lat": "latitude", "lon": "longitude"})
+            
+            return ds
+
+        ds_cf = normalize_dataset(ds_cf)
+        ds_pf = normalize_dataset(ds_pf)
+
+        # Combine control and perturbed forecasts
+        da_cf = ds_cf[var]
+        da_pf = ds_pf[var]
+        da_all = xr.concat(
+            [da_cf] + [da_pf.isel(ensemble=i) for i in range(da_pf.sizes["ensemble"])],
+            dim="ensemble"
+        )
+        
+        # Apply scaling and metadata
+        da_all = da_all * VAR_META[var]["scale"]
+        da_all.attrs.update(
+            units=VAR_META[var]["units"],
+            long_name=VAR_META[var]["name"]
+        )
+        datasets[var] = da_all
+
+    return datasets
+
+
+# ---------------- Helper functions ----------------
+def area_mean(da):
+    """Calculate area-weighted mean over latitude/longitude."""
+    latc = next(c for c in da.coords if "lat" in c.lower())
+    lonc = next(c for c in da.coords if "lon" in c.lower())
+    weights = np.cos(np.deg2rad(da[latc]))
+    return da.weighted(weights).mean(dim=[latc, lonc], skipna=True)
+
+
+def interp_point(da, lat, lon):
+    """Interpolate to a single point with coordinate handling."""
+    latc = next(c for c in da.coords if "lat" in c.lower())
+    lonc = next(c for c in da.coords if "lon" in c.lower())
+    
+    # Handle longitude conventions
+    if float(da[lonc].max()) > 180 and lon < 0:
+        lon = lon + 360
+    if float(da[lonc].max()) <= 180 and lon > 180:
+        lon = lon - 360
+    
+    if da[latc].ndim == 1 and da[lonc].ndim == 1:
+        return da.interp({latc: float(lat), lonc: float(lon)})
+    else:
+        return da.sel({latc: float(lat), lonc: float(lon)}, method="nearest")
+
+
+def save_site_csvs(datasets, init_date):
+    """Save CSV files for each site and variable."""
+    print("\n>> Saving site CSV files...")
+    
+    for var, da in datasets.items():
+        for site in SITES:
+            # Extract point data
+            pt = interp_point(da, site["lat"], site["lon"])
+            
+            # Convert to DataFrame
+            df = (pt.to_series()
+                   .reset_index()
+                   .pivot(index="time", columns="ensemble", values=0)
+                   .rename_axis(None, axis=1))
+            df.index = pd.to_datetime(df.index)
+            
+            # Add ensemble statistics
+            df["mean"] = df.mean(axis=1)
+            df["std"] = df.std(axis=1)
+            df["p10"] = df.quantile(0.10, axis=1)
+            df["p90"] = df.quantile(0.90, axis=1)
+            df["min"] = df.min(axis=1)
+            df["max"] = df.max(axis=1)
+            
+            # Save CSV
+            csv_path = OUT_DIR / f"site_{site['site']}_{var}_{init_date:%Y%m%d}.csv"
+            df.to_csv(csv_path, float_format='%.3f')
+            print(f"   Saved: {csv_path}")
+            
+            # Print sample data
+            print(f"   {site['site']} - {VAR_META[var]['name']}:")
+            print(f"     First 3 days mean: {df['mean'].iloc[:3].values}")
+            print(f"     Units: {VAR_META[var]['units']}")
+
+
+def create_plots(datasets, init_date):
+    """Create visualization plots."""
+    print("\n>> Creating plots...")
+    
+    # Area-mean time series
+    n_vars = len(datasets)
+    fig, axes = plt.subplots(n_vars, 1, figsize=(12, 4*n_vars), sharex=True)
+    if n_vars == 1:
+        axes = [axes]
+    
+    for ax, (var, da) in zip(axes, datasets.items()):
+        am = area_mean(da)
+        
+        # Plot individual ensemble members
+        for k in range(am.sizes["ensemble"]):
+            ax.plot(am["time"].values, am.isel(ensemble=k).values, 
+                   color="gray", alpha=0.25, lw=0.8)
+        
+        # Plot ensemble statistics
+        mean_val = am.mean("ensemble")
+        std_val = am.std("ensemble")
+        ax.plot(mean_val["time"].values, mean_val.values, 
+               lw=2, color="blue", label="Ensemble mean")
+        ax.fill_between(mean_val["time"].values, 
+                       (mean_val - std_val).values,
+                       (mean_val + std_val).values, 
+                       alpha=0.2, color="blue", label="±1σ")
+        
+        ax.set_title(f"{VAR_META[var]['name']} — India area mean (init {init_date:%Y-%m-%d})")
+        ax.set_ylabel(VAR_META[var]["units"])
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    
+    axes[-1].set_xlabel("Date")
+    plt.tight_layout()
+    plot_path = PLOT_DIR / f"timeseries_areamean_{init_date:%Y%m%d}.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"   Saved: {plot_path}")
+
+    # Individual site plots
+    for site in SITES:
+        fig, axes = plt.subplots(n_vars, 1, figsize=(12, 4*n_vars), sharex=True)
+        if n_vars == 1:
+            axes = [axes]
+        
+        for ax, (var, da) in zip(axes, datasets.items()):
+            pt = interp_point(da, site["lat"], site["lon"])
+            mean_val = pt.mean("ensemble")
+            std_val = pt.std("ensemble")
+            time_vals = pd.to_datetime(mean_val["time"].values)
+            
+            ax.plot(time_vals, mean_val.values, lw=2, color="red", label="Ensemble mean")
+            ax.fill_between(time_vals, 
+                           (mean_val - std_val).values,
+                           (mean_val + std_val).values, 
+                           alpha=0.2, color="red", label="±1σ")
+            
+            ax.set_ylabel(VAR_META[var]["units"])
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"{site['site']}: {VAR_META[var]['name']} (init {init_date:%Y-%m-%d})")
+            ax.legend()
+        
+        axes[-1].set_xlabel("Date")
+        plt.tight_layout()
+        plot_path = PLOT_DIR / f"site_{site['site']}_{init_date:%Y%m%d}.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"   Saved: {plot_path}")
+
+
+def main():
+    """Main execution function."""
+    print("=== ECMWF S2S India → Site Time Series ===")
+    print(f"Mode: {ACCESS_METHOD}")
+    print("Sites:")
+    for site in SITES:
+        print(f"  - {site['site']}: {site['lat']:.5f}°N, {site['lon']:.5f}°E")
+    
+    print(f"Variables: {', '.join(VARIABLES)}")
+    print(f"Forecast horizon: {FORECAST_DAYS} days")
+    
+    # Get initialization date
+    init_date = recent_s2s_init()
+    print(f"Initialization date: {init_date:%Y-%m-%d} (Mon/Thu)")
+    
+    # Generate or download data
+    if ACCESS_METHOD == "demo":
+        datasets = demo_grids(init_date)
+    elif ACCESS_METHOD == "ecmwfapi":
+        datasets = ecmwfapi_grids(init_date)
+    else:
+        raise ValueError("ACCESS_METHOD must be 'demo' or 'ecmwfapi'")
+    
+    # Save gridded NetCDF files
+    print("\n>> Saving gridded NetCDF files...")
+    for var, da in datasets.items():
+        nc_path = OUT_DIR / f"grid_{var}_{init_date:%Y%m%d}.nc"
+        da.to_dataset(name=var).to_netcdf(
+            nc_path, 
+            encoding={var: {"zlib": True, "complevel": 4}}
+        )
+        print(f"   Saved: {nc_path}")
+    
+    # Save site CSV files
+    save_site_csvs(datasets, init_date)
+    
+    # Create plots
+    create_plots(datasets, init_date)
+    
+    print(f"\n✓ All outputs saved to: {OUT_DIR}")
+    print(f"✓ CSV files contain {FORECAST_DAYS} days of forecasts")
+    print(f"✓ Each CSV includes individual ensemble members + statistics")
+
+
+if __name__ == "__main__":
+    main()
